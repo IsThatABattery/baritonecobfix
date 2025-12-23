@@ -74,6 +74,8 @@ import java.lang.reflect.Method;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -237,7 +239,16 @@ public final class BlockOptionalMeta {
             } else {
                 List<Item> items = new ArrayList<>();
                 try {
-                    ServerLevel lv2 = ServerLevelStub.fastCreate();
+                    ServerLevelStub lv2 = ServerLevelStub.fastCreate();
+                    // Check if registry is ready before proceeding
+                    if (!lv2.isRegistryReady()) {
+                        // Return the block's item as a fallback when registry isn't ready
+                        Item blockItem = block.asItem();
+                        if (blockItem != Items.AIR) {
+                            return Collections.singletonList(blockItem);
+                        }
+                        return Collections.emptyList();
+                    }
 
                     LootParams.Builder lv5 = new LootParams.Builder(lv2)
                         .withParameter(LootContextParams.ORIGIN, Vec3.ZERO)
@@ -245,7 +256,11 @@ public final class BlockOptionalMeta {
                         .withParameter(LootContextParams.TOOL, new ItemStack(Items.NETHERITE_PICKAXE, 1));
                     getDrops(block, lv5).stream().map(ItemStack::getItem).forEach(items::add);
                 } catch (Exception e) {
-                    e.printStackTrace();
+                    // Fallback: return the block's item if loot table lookup fails
+                    Item blockItem = block.asItem();
+                    if (blockItem != Items.AIR) {
+                        return Collections.singletonList(blockItem);
+                    }
                 }
                 return items;
             }
@@ -259,7 +274,14 @@ public final class BlockOptionalMeta {
         } else {
             LootParams lv2 = params.withParameter(LootContextParams.BLOCK_STATE, state.defaultBlockState()).create(LootContextParamSets.BLOCK);
             ServerLevelStub lv3 = (ServerLevelStub) lv2.getLevel();
-            LootTable lv4 = lv3.holder().getLootTable(lv);
+            ReloadableServerRegistries.Holder holder = lv3.holder();
+            if (holder == null) {
+                return Collections.emptyList();
+            }
+            LootTable lv4 = holder.getLootTable(lv);
+            if (lv4 == null || lv4 == LootTable.EMPTY) {
+                return Collections.emptyList();
+            }
             return((ILootTable) lv4).invokeGetRandomItems(new LootContext.Builder(lv2).withOptionalRandomSeed(1).create(null));
         }
     }
@@ -267,7 +289,10 @@ public final class BlockOptionalMeta {
     public static class ServerLevelStub extends ServerLevel {
         private static Minecraft client = Minecraft.getInstance();
         private static Unsafe unsafe = getUnsafe();
-        private static CompletableFuture<RegistryAccess> registryAccess = load();
+        private static volatile CompletableFuture<RegistryAccess.Frozen> registryAccessFuture = null;
+        private static volatile RegistryAccess.Frozen cachedRegistryAccess = null;
+        private static volatile boolean loadFailed = false;
+        private static final long REGISTRY_TIMEOUT_MS = 5000; // 5 second timeout
 
         public ServerLevelStub(MinecraftServer $$0, Executor $$1, LevelStorageSource.LevelStorageAccess $$2, ServerLevelData $$3, ResourceKey<Level> $$4, LevelStem $$5, ChunkProgressListener $$6, boolean $$7, long $$8, List<CustomSpawner> $$9, boolean $$10, @Nullable RandomSequences $$11) {
             super($$0, $$1, $$2, $$3, $$4, $$5, $$6, $$7, $$8, $$9, $$10, $$11);
@@ -275,8 +300,10 @@ public final class BlockOptionalMeta {
 
         @Override
         public FeatureFlagSet enabledFeatures() {
-            assert client.level != null;
-            return client.level.enabledFeatures();
+            if (client.level != null) {
+                return client.level.enabledFeatures();
+            }
+            return FeatureFlags.VANILLA_SET;
         }
 
         public static ServerLevelStub fastCreate() {
@@ -287,13 +314,70 @@ public final class BlockOptionalMeta {
             }
         }
 
-        @Override
-        public RegistryAccess registryAccess() {
-            return registryAccess.join();
+        /**
+         * Check if the registry is ready without blocking.
+         * Returns true if the registry has been loaded successfully.
+         */
+        public boolean isRegistryReady() {
+            if (cachedRegistryAccess != null) {
+                return true;
+            }
+            if (loadFailed) {
+                return false;
+            }
+            ensureLoadStarted();
+            return registryAccessFuture != null && registryAccessFuture.isDone() && !registryAccessFuture.isCompletedExceptionally();
         }
 
+        private static synchronized void ensureLoadStarted() {
+            if (registryAccessFuture == null && !loadFailed) {
+                registryAccessFuture = load();
+            }
+        }
+
+        @Override
+        public RegistryAccess registryAccess() {
+            return frozenRegistryAccess();
+        }
+
+        @Nullable
+        private RegistryAccess.Frozen frozenRegistryAccess() {
+            if (cachedRegistryAccess != null) {
+                return cachedRegistryAccess;
+            }
+            if (loadFailed) {
+                return null;
+            }
+            ensureLoadStarted();
+            try {
+                // Use timeout to prevent deadlock
+                cachedRegistryAccess = registryAccessFuture.get(REGISTRY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                return cachedRegistryAccess;
+            } catch (TimeoutException e) {
+                loadFailed = true;
+                System.err.println("Baritone: Registry loading timed out - this may indicate a deadlock");
+                return null;
+            } catch (Exception e) {
+                loadFailed = true;
+                System.err.println("Baritone: Failed to load registry: " + e.getMessage());
+                return null;
+            }
+        }
+
+        @Nullable
         public ReloadableServerRegistries.Holder holder() {
-            return new ReloadableServerRegistries.Holder(registryAccess().freeze());
+            if (!isRegistryReady()) {
+                return null;
+            }
+            try {
+                RegistryAccess.Frozen frozen = frozenRegistryAccess();
+                if (frozen == null) {
+                    return null;
+                }
+                return new ReloadableServerRegistries.Holder(frozen);
+            } catch (Exception e) {
+                return null;
+            }
         }
 
         public static Unsafe getUnsafe() {
@@ -306,24 +390,59 @@ public final class BlockOptionalMeta {
             }
         }
 
-        public static CompletableFuture<RegistryAccess> load() {
-            PackRepository packRepository = Minecraft.getInstance().getResourcePackRepository();
-            CloseableResourceManager closeableResourceManager = new MultiPackResourceManager(
-                PackType.SERVER_DATA,
-                List.of(packRepository.getPack(BuiltInPackSource.VANILLA_ID).open())
-            );
-            LayeredRegistryAccess<RegistryLayer> layeredRegistryAccess = loadAndReplaceLayer(
-                closeableResourceManager, RegistryLayer.createRegistryAccess(), RegistryLayer.WORLDGEN, RegistryDataLoader.WORLDGEN_REGISTRIES
-            );
-            return ReloadableServerResources.loadResources(
-                closeableResourceManager,
-                layeredRegistryAccess,
-                FeatureFlags.VANILLA_SET,
-                Commands.CommandSelection.INTEGRATED,
-                2,
-                Runnable::run,
-                Minecraft.getInstance()
-            ).thenApply(reloadableServerResources -> reloadableServerResources.fullRegistries().get());
+        public static CompletableFuture<RegistryAccess.Frozen> load() {
+            try {
+                PackRepository packRepository = Minecraft.getInstance().getResourcePackRepository();
+                
+                // Collect all available packs, not just vanilla
+                List<Pack> availablePacks = new ArrayList<>();
+                Pack vanillaPack = packRepository.getPack(BuiltInPackSource.VANILLA_ID);
+                if (vanillaPack != null) {
+                    availablePacks.add(vanillaPack);
+                }
+                
+                // Also add any other selected packs (mod packs, datapacks)
+                for (Pack pack : packRepository.getSelectedPacks()) {
+                    if (!availablePacks.contains(pack)) {
+                        availablePacks.add(pack);
+                    }
+                }
+                
+                if (availablePacks.isEmpty()) {
+                    return CompletableFuture.failedFuture(new IllegalStateException("No resource packs available"));
+                }
+                
+                CloseableResourceManager closeableResourceManager = new MultiPackResourceManager(
+                    PackType.SERVER_DATA,
+                    availablePacks.stream().map(Pack::open).toList()
+                );
+                LayeredRegistryAccess<RegistryLayer> layeredRegistryAccess = loadAndReplaceLayer(
+                    closeableResourceManager, RegistryLayer.createRegistryAccess(), RegistryLayer.WORLDGEN, RegistryDataLoader.WORLDGEN_REGISTRIES
+                );
+                
+                // Use a separate executor to avoid blocking the main thread
+                Executor asyncExecutor = CompletableFuture.delayedExecutor(0, TimeUnit.MILLISECONDS);
+                
+                return ReloadableServerResources.loadResources(
+                    closeableResourceManager,
+                    layeredRegistryAccess,
+                    client.level != null ? client.level.enabledFeatures() : FeatureFlags.VANILLA_SET,
+                    Commands.CommandSelection.INTEGRATED,
+                    2,
+                    asyncExecutor,
+                    asyncExecutor
+                ).thenApply(reloadableServerResources -> reloadableServerResources.fullRegistries().get())
+                 .exceptionally(throwable -> {
+                     // Log the error but don't crash - return null and let callers handle it
+                     System.err.println("Baritone: Failed to load loot table registry: " + throwable.getMessage());
+                     loadFailed = true;
+                     return null;
+                 });
+            } catch (Exception e) {
+                System.err.println("Baritone: Exception during registry load setup: " + e.getMessage());
+                loadFailed = true;
+                return CompletableFuture.failedFuture(e);
+            }
         }
 
         private static LayeredRegistryAccess<RegistryLayer> loadAndReplaceLayer(

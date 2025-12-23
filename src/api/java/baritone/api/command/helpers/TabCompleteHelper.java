@@ -207,11 +207,28 @@ public class TabCompleteHelper {
      * Filter out any element that doesn't start with {@code prefix} and return this object for chaining
      * <p>
      * Assumes every element in this {@link TabCompleteHelper} is a {@link ResourceLocation}
+     * <p>
+     * If the prefix contains no namespace (no colon), matches against all namespaces by the path alone.
+     * This allows modded items/blocks to appear in tab completion even when typing without a namespace prefix.
      *
      * @param prefix The prefix to filter for
      * @return This {@link TabCompleteHelper}
      */
     public TabCompleteHelper filterPrefixNamespaced(String prefix) {
+        // If no colon in prefix, search all namespaces by path
+        if (!prefix.contains(":")) {
+            String lowerPrefix = prefix.toLowerCase(Locale.US);
+            return filter(x -> {
+                ResourceLocation loc = ResourceLocation.tryParse(x);
+                if (loc == null) {
+                    return x.toLowerCase(Locale.US).startsWith(lowerPrefix);
+                }
+                // Match if the path starts with prefix, or if the full string starts with prefix
+                return loc.getPath().toLowerCase(Locale.US).startsWith(lowerPrefix) 
+                    || x.toLowerCase(Locale.US).startsWith(lowerPrefix);
+            });
+        }
+        
         ResourceLocation loc = ResourceLocation.tryParse(prefix);
         if (loc == null) {
             stream = Stream.empty();
